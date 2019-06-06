@@ -4,14 +4,21 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon app.js"
+    "dev": "nodemon app.js",
+    "prod": "node app.js -u http://localhost:80 -p 80"
+  },
+  "bin": {
+    "node_phish": "./app.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "axios": "^0.18.0",
+    "basic-auth": "^2.0.1",
+    "commander": "^2.20.0",
     "express": "^4.17.0",
     "http": "0.0.0",
+    "lowdb": "^1.0.0",
     "querystring": "^0.2.0",
     "request": "^2.88.0"
   },
